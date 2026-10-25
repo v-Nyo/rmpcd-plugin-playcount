@@ -6,6 +6,7 @@
 ---@field from? "start" | "end"
 ---@field target_fraction? number
 ---@field target_percent? number
+---@field loop? boolean
 
 ---@class PlayCountPlugin : RmpcdPlugin<PlayCountPluginArgs>
 ---@field enabled boolean
@@ -15,9 +16,15 @@
 ---@field from? "start" | "end"
 ---@field target_fraction number|nil
 ---@field sticker_name string
+---@field loop boolean
+---@field loop_state boolean
+---@field loop_timer table|nil
+---@field loop_saved_ms number|nil
+---@field loop_song_id integer|nil
 
 local DEFAULT_PADDING_FACTOR_MS = 15000 -- 15 seconds
 local SAFETY_FACTOR_MS = 2000 -- 2 seconds
+local LOOP_EXTRA_MS = 5000 -- 5 extra seconds added to loop timer
 local DEFAULT_STICKER_NAME = "playCount";
 
 ---@class PlayCountPlugin
@@ -29,6 +36,11 @@ local M = {
     from = "end";
     target_fraction = nil;
     sticker_name = DEFAULT_STICKER_NAME;
+    loop = false;
+    loop_state = false;
+    loop_timer = nil;
+    loop_saved_ms = nil;
+    loop_song_id = nil;
 }
 
 -- Sometimes MPD has sond durations in ms, others in a { secs, nanos } structure. Here we handle both.
@@ -44,6 +56,59 @@ function M:cancel_timeout()
         self.timeout_handle.cancel()
         self.timeout_handle = nil
     end
+end
+
+function M:cancel_loop_timer()
+    if self.loop_timer then
+        self.loop_timer.cancel()
+        self.loop_timer = nil
+    end
+end
+
+-- Arms (or re-arms) the loop timer. remaining_ms defaults to "time left in current song plus 5 seconds".
+---@param remaining_ms number|nil
+function M:arm_loop_timer(remaining_ms)
+    if not self.loop or not self.loop_state then return end
+    self:cancel_loop_timer()
+
+    if remaining_ms == nil then
+        local status = mpd.get_status()
+        local song = mpd.get_current_song()
+        if not (status and song) then
+            self.loop_state = false
+            return
+        end
+        remaining_ms = duration_in_ms(song.duration) - status.elapsed
+    end
+    if remaining_ms <= 0 then remaining_ms = 0 end
+
+    local cur = mpd.get_current_song()
+    if not cur then
+        self.loop_state = false
+        return
+    end
+    self.loop_song_id = cur.id
+    self.loop_saved_ms = remaining_ms
+    -- For short songs, adding the full 5s bonus would make the timer fire long after the
+    -- song ended. Cap the bonus so the timer fires at (or just after) the song boundary.
+    -- The 250ms floor keeps very short clips from re-arming the timer in a tight loop.
+    local bonus = math.min(LOOP_EXTRA_MS, math.max(remaining_ms / 2, 250))
+    self.loop_timer = sync.set_timeout(remaining_ms + bonus, function()
+        self.loop_timer = nil
+        local now = mpd.get_current_song()
+        -- Safety check: only re-increment if it's still the same song
+        if now and now.id == self.loop_song_id then
+            -- Bypass the "don't double-count same song_id" guard, since looping is intentional
+            self.last_incremented_song_id = nil
+            self:increment_playcount(now.file, now.id)
+            -- If increment_playcount didn't re-arm (e.g. increment failed), re-arm here
+            if self.loop_state and not self.loop_timer then
+                self:arm_loop_timer()
+            end
+        else
+            self.loop_state = false
+        end
+    end)
 end
 
 --- @param file string
@@ -64,6 +129,11 @@ function M:increment_playcount(file, song_id)
         local oldcount = tonumber(oldsticker) or 0
         mpd.set_song_sticker(file, self.sticker_name, tostring(oldcount + 1))
         log.info(file .. " has now been played " .. (oldcount + 1) .. " times.")
+        -- Loop mode: the first successful increment arms the loop timer
+        if self.loop and not self.loop_state then
+            self.loop_state = true
+            self:arm_loop_timer()
+        end
     end
 end
 
@@ -84,10 +154,6 @@ function M:calculate_target_position(song_duration_ms)
         local target = self.padding_factor_ms
         return math.min(target, song_duration_ms - SAFETY_FACTOR_MS)
     else
-        -- Could do it this way:
-        -- local target = song_duration_ms - self.padding_factor_ms
-        -- return math.min(target, song_duration_ms - SAFETY_FACTOR_MS)
-        -- But the below is exactly equivalent to that, and does one fewer subtraction
         return song_duration_ms - math.max(self.padding_factor_ms, SAFETY_FACTOR_MS)
     end
 end
@@ -101,10 +167,6 @@ end
 
 -- Set up the timeout for N (configurable, default 15) seconds before the end of the song
 -- Once the timeout fires, we will increment the song's playCount sticker
--- We use the song's id (a unique value assigned by MPD) to ensure we never double-increment for a single play
--- If we used the song's file for this, we might only add a single play count when the song gets played repeatedly
--- We also need to know how much time has elapsed in the song so far (which can happen when unpausing), since that
--- will change the calculation for how long the tieout needs to be so that it triggers N seconds before the song ends
 ---@param song QueuedSong
 ---@param already_elapsed_ms number
 function M:setup_timeout(song, already_elapsed_ms)
@@ -139,13 +201,14 @@ end
 --- @param _old_song QueuedSong
 --- @param new_song QueuedSong
 -- Will be called when a song changes.
--- Interestingly, in repeat+single mode (where one song loops repeatedly) this will only get called once,
--- when the song is first played. Repeating the same song isn't a "change" so this event doesn't get called.
--- I prefer that behavior, so I'm not going to try to add extra complexity to detect whether a song is
--- being looped forever. If you want your playCount sticker to be incremented by 50 when a song loops 50 times,
--- you can do `rmpc sticker get MySong.mp3 playCount` and then `rmpc sticker set mySong.mp3 playCount N`
--- (where N = old value + 50) yourself, in a bash script or something.
+-- Note: in repeat+single mode (one song loops forever) this only fires once, when the song is first
+-- played. That's fine here: the loop timer handles repeated plays of the same song_id by design.
 function M:song_change(_old_song, new_song)
+    -- Loop resets on song change
+    self:cancel_loop_timer()
+    self.loop_state = false
+    self.loop_saved_ms = nil
+
     if not self.enabled or new_song == nil or not new_song.file then
         self:cancel_timeout()
         return
@@ -155,18 +218,39 @@ function M:song_change(_old_song, new_song)
 end
 
 -- Will be called when playback is started, stopped or paused. A few cases need to be handled:
--- Stopping playback = cancel the timeout if it hasn't fired yet, because the song didn't play for long enough
--- Pausing playback = ditto, but when playback resumes the song's time elapsed so far will be counted
--- Unpausing playback = the timeout (which was canceled when playback was paused) can should be restarted now
--- Starting playback = 
+-- Stopping playback = cancel the timeout if it hasn't fired yet, and cancel the loop timer
+-- Pausing playback = save remaining loop duration, cancel loop timer (restored on unpause)
+-- Unpausing playback = restart both the timeout and the loop timer
+-- Starting playback = same as unpausing
 function M:state_change(old, new)
     if not self.enabled then
         self:cancel_timeout()
+        self:cancel_loop_timer()
+        self.loop_state = false
         return
     end
 
-    if new == "pause" or new == "stop" then self:cancel_timeout() end
-    if new == "play" then self:resume_after_pause() end
+    if new == "pause" or new == "stop" then
+        self:cancel_timeout()
+        -- Save remaining loop duration before canceling, so it can be restored on resume
+        if self.loop_state then
+            local status = mpd.get_status()
+            local song = mpd.get_current_song()
+            if status and song then
+                self.loop_saved_ms = duration_in_ms(song.duration) - status.elapsed
+                if self.loop_saved_ms < 0 then self.loop_saved_ms = 0 end
+            end
+            self:cancel_loop_timer()
+        end
+    end
+    if new == "play" then
+        self:resume_after_pause()
+        -- Restart loop timer with the duration saved when we paused
+        if self.loop_state and self.loop_saved_ms then
+            self:arm_loop_timer(self.loop_saved_ms)
+            self.loop_saved_ms = nil
+        end
+    end
 end
 
 --- @param value number
@@ -213,12 +297,6 @@ function M:setup(args)
     elseif args.target_percent ~= nil then
         self.target_fraction = self:clamp_between_0_and_1(args.target_percent / 100, "The target_percent parameter should be between 0 and 100.")
     end
-    if args.padding_factor_seconds ~= nil then
-        self.padding_factor_ms = args.padding_factor_seconds * 1000
-    end
-    if args.padding_factor_milliseconds ~= nil then
-        self.padding_factor_ms = args.padding_factor_milliseconds
-    end
     if args.sticker_name then
         self.sticker_name = args.sticker_name
     end
@@ -228,6 +306,9 @@ function M:setup(args)
         else
             log.warn("\"from\" parameter should be either \"start\" or \"end\" (default \"end\"). Ignoring unknown value \"" .. args.from .. "\"")
         end
+    end
+    if args.loop ~= nil then
+        self.loop = args.loop
     end
 
     -- Same logic for resiming after pause (check times elapsed, etc) works here too, so just reuse it
@@ -290,8 +371,6 @@ function M:message(_channel, message)
         end
     -- Changing parameters on-the-fly: sticker name
     -- CAUTION: No attempt is made to validate the new name. Make sure you spelled it the way you want it to be spelled!
-    -- Note also that no attempt is made to search the sticker database and rename anything from the old name to the new name
-    -- So changing this while the plugin is running is almost never useful, but we include the option for completeness' sake
     elseif string.find(message, "sticker_name:") == 1 then
         local len = string.len("sticker_name:")
         local new_name = string.sub(message, len)
